@@ -47,10 +47,30 @@ contract Strategy is BaseStrategy {
         bool realizeLossOn;
     }
 
-    constructor(address _vault) public BaseStrategy(_vault) {
+    constructor(
+        address _vault
+    )
+    public BaseStrategy(_vault) {
+        _initializeStrat(_vault);
+    }
+
+    function initialize(
+        address _vault,
+        address _strategist,
+        address _rewards,
+        address _keeper
+    ) external {
+        _initialize(_vault, _strategist, _rewards, _keeper);
+        _initializeStrat(_vault);
+    }
+
+    function _initializeStrat(
+        address _vault
+    ) internal {
         poolCollection = bancor.collectionByPool(want);
         poolToken = poolCollection.poolToken(want);
     }
+
 
     function name() external view override returns (string memory) {
         return
