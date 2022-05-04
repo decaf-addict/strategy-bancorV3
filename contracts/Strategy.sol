@@ -15,6 +15,12 @@ import "../interfaces/Bancor/IBancorNetwork.sol";
 import "../interfaces/Bancor/IPoolCollection.sol";
 import "../interfaces/Bancor/IPendingWithdrawals.sol";
 
+interface ITradeFactory {
+    function enable(address, address) external;
+
+    function disable(address, address) external;
+}
+
 contract Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
@@ -25,6 +31,7 @@ contract Strategy is BaseStrategy {
     IPoolToken public poolToken;
     IERC20[] public lmRewards;
     Toggles public toggles;
+    ITradeFactory public tradeFactory;
 
     modifier isVaultManager {
         checkVaultManagers();
@@ -85,7 +92,7 @@ contract Strategy is BaseStrategy {
                 _loss = totalDebt.sub(totalAssets);
                 _debtPayment = Math.min(_debtPayment, _debtOutstanding.sub(_loss));
             } else {
-                // this scenario is when there's loss but we defer it to the the remaining funds instead of socializing it
+                // this scenario is when there's loss but we defer it to the the remaining funds instead of realizing it
             }
         }
     }
@@ -174,20 +181,21 @@ contract Strategy is BaseStrategy {
     }
 
     // _checkAllowance adapted from https://github.com/therealmonoloco/liquity-stability-pool-strategy/blob/1fb0b00d24e0f5621f1e57def98c26900d551089/contracts/Strategy.sol#L316
-
     function _checkAllowance(
         address _spender,
         address _token,
         uint256 _amount
     ) internal {
-        uint256 _currentAllowance = IERC20(_token).allowance(
-            address(this),
-            _spender
-        );
+        uint256 _currentAllowance = IERC20(_token).allowance(address(this), _spender);
         if (_currentAllowance < _amount) {
             IERC20(_token).safeIncreaseAllowance(
                 _spender,
                 _amount - _currentAllowance
+            );
+        } else {
+            IERC20(_token).safeDecreaseAllowance(
+                _spender,
+                _currentAllowance - _amount
             );
         }
     }
@@ -234,13 +242,34 @@ contract Strategy is BaseStrategy {
 
 
     /// for bnt and other possible rewards from liquidity mining
-    function whitelistRewards(IERC20 _reward) public isVaultManager {
-        //        approve trade factory
-        //        _reward.approve(, max);
+    function whitelistRewards(IERC20 _reward) external isVaultManager {
         lmRewards.push(_reward);
+        _checkAllowance(address(tradeFactory), address(_reward), type(uint256).max);
+        tradeFactory.enable(address(_reward), address(want));
     }
 
-    function setToggles(Toggles memory _toggles) public isVaultManager {
+    function delistAllRewards() external isVaultManager {
+        delete lmRewards;
+        _disallowAllRewards();
+    }
+
+    function _disallowAllRewards() internal {
+        for (uint8 i; i < lmRewards.length; i++) {
+            _checkAllowance(address(tradeFactory), address(lmRewards[i]), 0);
+            tradeFactory.disable(address(lmRewards[i]), address(want));
+        }
+    }
+
+    function setToggles(Toggles memory _toggles) external isVaultManager {
         toggles = _toggles;
+    }
+
+    function setTradeFactory(ITradeFactory _tradeFactory) external onlyGovernance {
+        tradeFactory = _tradeFactory;
+    }
+
+    function disableTradeFactory() external onlyVaultManagers {
+        delete tradeFactory;
+        _disallowAllRewards();
     }
 }
