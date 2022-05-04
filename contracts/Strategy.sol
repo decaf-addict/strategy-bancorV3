@@ -40,9 +40,6 @@ contract Strategy is BaseStrategy {
         bool realizeLossOn;
     }
 
-    // Bancor gives you an ID for a withdrawal request, so we manage it like this
-    uint256 public totalRequestedWithdrawalAmount; // Denominated in bancor pool tokens
-
     constructor(address _vault) public BaseStrategy(_vault) {
         poolCollection = bancor.collectionByPool(want);
         poolToken = poolCollection.poolToken(want);
@@ -60,7 +57,8 @@ contract Strategy is BaseStrategy {
 
     /// tokens pending withdrawals are actually send to the pendingWithdarwal contract so must be accounted for separately
     function estimatedTotalAssets() public view override returns (uint256) {
-        return balanceOfWant() + valueOfPoolToken() + balanceOfPendingWithdrawals();
+        (,uint totalPending) = withdrawalRequestsInfo();
+        return balanceOfWant() + valueOfPoolToken() + totalPending;
     }
 
     /// This strategy's accounting is a little different because funds are not liquid.
@@ -109,10 +107,6 @@ contract Strategy is BaseStrategy {
         }
     }
 
-    /// Only allow manual exits
-    function liquidatePositionManual(uint256 _amountNeeded) external isVaultManager {
-
-    }
 
     /* NOTE: Bancor has a waiting period for withdrawals. We need to first request
              a withdrawal, at which point we recieve a withdrawal request ID. 7 days later,
@@ -149,6 +143,11 @@ contract Strategy is BaseStrategy {
 
     // ----------------- SUPPORT & UTILITY FUNCTIONS ----------
 
+
+    function requestWithdrawal(uint256 _poolTokenAmount) external isVaultManager {
+        _requestWithdrawal(_poolTokenAmount);
+    }
+
     function _requestWithdrawal(uint256 _poolTokenAmount) internal {
         uint256 _withdrawalID = bancor.initWithdrawal(poolToken, _poolTokenAmount);
 
@@ -156,20 +155,21 @@ contract Strategy is BaseStrategy {
         _poolTokenAmount = _poolTokenAmount > balanceOfPoolToken() ? balanceOfPoolToken() : _poolTokenAmount;
 
         // Technically we're losing bits 32-255 in the cast, but this should only matter if more than 4.2B withdrawal requests happen
-        totalRequestedWithdrawalAmount += _poolTokenAmount;
     }
 
-    function _withdrawCheck(uint256 _withdrawalID) internal {
-        totalRequestedWithdrawalAmount -= pendingWithdrawals.withdrawalRequest(_withdrawalID).poolTokenAmount;
+    function completeWithdrawal(uint256 _withdrawalID) external isVaultManager {
+        _completeWithdrawal(_withdrawalID);
     }
 
     function _completeWithdrawal(uint256 _withdrawalID) internal {
-        _withdrawCheck(_withdrawalID);
         bancor.withdraw(_withdrawalID);
     }
 
+    function cancelWithdrawal(uint256 _withdrawalID) external isVaultManager {
+        _cancelWithdrawal(_withdrawalID);
+    }
+
     function _cancelWithdrawal(uint256 _withdrawalID) internal {
-        _withdrawCheck(_withdrawalID);
         bancor.cancelWithdrawal(_withdrawalID);
     }
 
@@ -205,12 +205,28 @@ contract Strategy is BaseStrategy {
     }
 
     /// sum amount of all pending withdrawals
-    function balanceOfPendingWithdrawals() public view returns (uint256 _wants){
+    struct WithdrawRequestInfo {
+        uint256 id;
+        uint256 expectedWantAmount;
+        uint256 poolTokenAmount;
+        uint256 timeToMaturation;
+    }
+
+    function withdrawalRequestsInfo() public view returns (WithdrawRequestInfo[] memory requestsInfo, uint256 _wants){
         uint256[] memory ids = pendingWithdrawals.withdrawalRequestIds(address(this));
+        requestsInfo = new WithdrawRequestInfo[](ids.length - 1);
         for (uint8 i = 0; i < ids.length; i++) {
+            uint256 matureTime = pendingWithdrawals.withdrawalRequest(ids[i]).createdAt + pendingWithdrawals.lockDuration();
+            requestsInfo[i] = WithdrawRequestInfo(
+                ids[i],
+                pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount,
+                pendingWithdrawals.withdrawalRequest(ids[i]).poolTokenAmount,
+                now > matureTime ? now - matureTime : 0
+            );
             _wants += pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount;
         }
     }
+
 
     function balanceOfReward(uint8 index) public view returns (uint256){
         return lmRewards[index].balanceOf(address(this));
