@@ -47,10 +47,7 @@ contract Strategy is BaseStrategy {
         bool realizeLossOn;
     }
 
-    constructor(
-        address _vault
-    )
-    public BaseStrategy(_vault) {
+    constructor(address _vault) public BaseStrategy(_vault) {
         _initializeStrat(_vault);
     }
 
@@ -69,6 +66,7 @@ contract Strategy is BaseStrategy {
     ) internal {
         poolCollection = bancor.collectionByPool(want);
         poolToken = poolCollection.poolToken(want);
+        want.safeApprove(address(bancor), type(uint256).max);
     }
 
 
@@ -124,16 +122,18 @@ contract Strategy is BaseStrategy {
             uint256 _amountToInvest = _balanceOfWant - _debtOutstanding;
 
             Pool memory poolData = poolCollection.poolData(want);
-            if (poolData.liquidity.stakedBalance + _amountToInvest > poolData.depositLimit) {
-                _amountToInvest = poolData.depositLimit - poolData.liquidity.stakedBalance;
-                if (_amountToInvest == 0) return;
+            uint256 depositLimit = poolData.depositLimit;
+            uint256 stakedBalance = poolData.liquidity.stakedBalance;
+            uint256 investable = depositLimit > stakedBalance ? depositLimit.sub(stakedBalance) : 0;
+            _amountToInvest = Math.min(investable, _amountToInvest);
+            if (_amountToInvest > 0) {
+                bancor.deposit(want, _amountToInvest);
             }
-
-            _checkAllowance(address(bancor), address(want), _amountToInvest);
-            bancor.deposit(want, _amountToInvest);
         }
     }
 
+    event Debug(string msg);
+    event Debug(string msg, uint val);
 
     /* NOTE: Bancor has a waiting period for withdrawals. We need to first request
              a withdrawal, at which point we recieve a withdrawal request ID. 7 days later,
@@ -242,16 +242,18 @@ contract Strategy is BaseStrategy {
 
     function withdrawalRequestsInfo() public view returns (WithdrawRequestInfo[] memory requestsInfo, uint256 _wants){
         uint256[] memory ids = pendingWithdrawals.withdrawalRequestIds(address(this));
-        requestsInfo = new WithdrawRequestInfo[](ids.length - 1);
-        for (uint8 i = 0; i < ids.length; i++) {
-            uint256 matureTime = pendingWithdrawals.withdrawalRequest(ids[i]).createdAt + pendingWithdrawals.lockDuration();
-            requestsInfo[i] = WithdrawRequestInfo(
-                ids[i],
-                pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount,
-                pendingWithdrawals.withdrawalRequest(ids[i]).poolTokenAmount,
-                now > matureTime ? now - matureTime : 0
-            );
-            _wants += pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount;
+        if (ids.length > 0) {
+            requestsInfo = new WithdrawRequestInfo[](ids.length - 1);
+            for (uint8 i = 0; i < ids.length; i++) {
+                uint256 matureTime = pendingWithdrawals.withdrawalRequest(ids[i]).createdAt + pendingWithdrawals.lockDuration();
+                requestsInfo[i] = WithdrawRequestInfo(
+                    ids[i],
+                    pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount,
+                    pendingWithdrawals.withdrawalRequest(ids[i]).poolTokenAmount,
+                    now > matureTime ? now - matureTime : 0
+                );
+                _wants += pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount;
+            }
         }
     }
 
@@ -264,7 +266,7 @@ contract Strategy is BaseStrategy {
     /// for bnt and other possible rewards from liquidity mining
     function whitelistRewards(IERC20 _reward) external isVaultManager {
         lmRewards.push(_reward);
-        _checkAllowance(address(tradeFactory), address(_reward), type(uint256).max);
+        _reward.approve(address(tradeFactory), type(uint256).max);
         tradeFactory.enable(address(_reward), address(want));
     }
 
@@ -275,7 +277,7 @@ contract Strategy is BaseStrategy {
 
     function _disallowAllRewards() internal {
         for (uint8 i; i < lmRewards.length; i++) {
-            _checkAllowance(address(tradeFactory), address(lmRewards[i]), 0);
+            lmRewards[i].safeApprove(address(tradeFactory), 0);
             tradeFactory.disable(address(lmRewards[i]), address(want));
         }
     }

@@ -40,7 +40,7 @@ def keeper(accounts):
 
 @pytest.fixture
 def token():
-    token_address = "0x6b175474e89094c44da98b954eedeac495271d0f"  # this should be the address of the ERC-20 used by the strategy/vault (DAI)
+    token_address = "0x6B175474E89094C44Da98b954EedeAC495271d0F"  # this should be the address of the ERC-20 used by the strategy/vault (DAI)
     yield Contract(token_address)
 
 
@@ -68,20 +68,46 @@ def weth_amout(user, weth):
 
 
 @pytest.fixture
-def vault(pm, gov, rewards, guardian, management, token):
+def from_gov(gov):
+    yield {'from': gov}
+
+
+@pytest.fixture
+def vault(pm, gov, rewards, guardian, management, token, from_gov):
     Vault = pm(config["dependencies"][0]).Vault
     vault = guardian.deploy(Vault)
-    vault.initialize(token, gov, rewards, "", "", guardian, management)
+    vault.initialize(token, gov, rewards, "", "", guardian, management, from_gov)
     vault.setDepositLimit(2 ** 256 - 1, {"from": gov})
     vault.setManagement(management, {"from": gov})
     yield vault
 
 
 @pytest.fixture
-def strategy(strategist, keeper, vault, Strategy, gov):
-    strategy = strategist.deploy(Strategy, vault)
-    strategy.setKeeper(keeper)
-    vault.addStrategy(strategy, 10_000, 0, 2 ** 256 - 1, 1_000, {"from": gov})
+def strategy_factory(strategist, keeper, vault, StrategyFactory, gov):
+    factory = strategist.deploy(StrategyFactory, vault)
+    yield factory
+
+
+@pytest.fixture
+def tradeFactory():
+    yield Contract("0x7BAF843e06095f68F4990Ca50161C2C4E4e01ec6")
+
+
+@pytest.fixture
+def yMechs():
+    yield Contract("0x2C01B4AD51a67E2d8F02208F54dF9aC4c0B778B6")
+
+
+@pytest.fixture
+def strategy(strategist, keeper, vault, Strategy, strategy_factory, gov, tradeFactory, yMechs, chain, from_gov):
+    strategy = Strategy.at(strategy_factory.original(), owner=gov)
+    strategy.setKeeper(keeper, {"from": gov})
+    vault.addStrategy(strategy, 10_000, 0, 2 ** 256 - 1, 1_000, from_gov)
+    tradeFactory.grantRole(
+        tradeFactory.STRATEGY(), strategy, {"from": yMechs, "gas_price": "0 gwei"}
+    )
+    strategy.setTradeFactory(tradeFactory, from_gov)
+    chain.sleep(1)
     yield strategy
 
 
