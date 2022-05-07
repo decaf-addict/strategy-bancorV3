@@ -4,7 +4,7 @@ import pytest
 
 
 def test_operation(
-    chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX, gov
 ):
     # Deposit to the vault
     user_balance_before = token.balanceOf(user)
@@ -16,19 +16,28 @@ def test_operation(
     chain.sleep(1)
     strategy.harvest()
     assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    assert strategy.balanceOfStakedPoolToken() > 0
 
     # tend()
     strategy.tend()
 
-    # withdrawal
-    vault.withdraw({"from": user})
+    strategy.requestWithdrawal(strategy.balanceOfStakedPoolToken(), True)
+
+    # 7 days of cooldown to withdraw
+    chain.sleep(3600 * 24 * 7 + 1)
+    id = strategy.withdrawalRequestsInfo()[0][0][0]
+    strategy.completeWithdrawal(id)
+
+    # no withdrawals allowed for strat, only debtPayment
+    vault.updateStrategyDebtRatio(strategy, 0)
+    vault.harvest({"from": gov})
     assert (
-        pytest.approx(token.balanceOf(user), rel=RELATIVE_APPROX) == user_balance_before
+            pytest.approx(token.balanceOf(user), rel=RELATIVE_APPROX) == user_balance_before
     )
 
 
 def test_emergency_exit(
-    chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
 ):
     # Deposit to the vault
     token.approve(vault.address, amount, {"from": user})
@@ -45,7 +54,7 @@ def test_emergency_exit(
 
 
 def test_profitable_harvest(
-    chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
 ):
     # Deposit to the vault
     token.approve(vault.address, amount, {"from": user})
@@ -71,7 +80,7 @@ def test_profitable_harvest(
 
 
 def test_change_debt(
-    chain, gov, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, gov, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
 ):
     # Deposit to the vault and harvest
     token.approve(vault.address, amount, {"from": user})
@@ -122,7 +131,7 @@ def test_sweep(gov, vault, strategy, token, user, amount, weth, weth_amout):
 
 
 def test_triggers(
-    chain, gov, vault, strategy, token, amount, user, weth, weth_amout, strategist
+        chain, gov, vault, strategy, token, amount, user, weth, weth_amout, strategist
 ):
     # Deposit to the vault and harvest
     token.approve(vault.address, amount, {"from": user})

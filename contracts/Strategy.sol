@@ -14,6 +14,7 @@ import {IERC20Metadata} from "@yearnvaults/contracts/yToken.sol";
 import "../interfaces/Bancor/IBancorNetwork.sol";
 import "../interfaces/Bancor/IPoolCollection.sol";
 import "../interfaces/Bancor/IPendingWithdrawals.sol";
+import "../interfaces/Bancor/IStandardRewards.sol";
 
 interface ITradeFactory {
     function enable(address, address) external;
@@ -26,12 +27,14 @@ contract Strategy is BaseStrategy {
     using Address for address;
 
     IBancorNetwork public constant bancor = IBancorNetwork(0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB);
+    IStandardRewards public constant standardRewards = IStandardRewards(0xb0B958398ABB0b5DB4ce4d7598Fb868f5A00f372);
     IPendingWithdrawals public constant pendingWithdrawals = IPendingWithdrawals(0x857Eb0Eb2572F7092C417CD386BA82e45EbA9B8a);
     IPoolCollection public poolCollection;
     IPoolToken public poolToken;
     IERC20[] public lmRewards;
     Toggles public toggles;
     ITradeFactory public tradeFactory;
+    uint256 public currentProgramId;
 
     modifier isVaultManager {
         checkVaultManagers();
@@ -61,12 +64,14 @@ contract Strategy is BaseStrategy {
         _initializeStrat(_vault);
     }
 
-    function _initializeStrat(
-        address _vault
-    ) internal {
+    function _initializeStrat(address _vault) internal {
         poolCollection = bancor.collectionByPool(want);
         poolToken = poolCollection.poolToken(want);
-        want.safeApprove(address(bancor), type(uint256).max);
+        want.safeApprove(address(standardRewards), type(uint256).max);
+        want.approve(address(bancor), type(uint256).max);
+        poolToken.approve(address(bancor), type(uint256).max);
+        poolToken.approve(address(pendingWithdrawals), type(uint256).max);
+        currentProgramId = standardRewards.latestProgramId(address(want));
     }
 
 
@@ -83,7 +88,7 @@ contract Strategy is BaseStrategy {
     /// tokens pending withdrawals are actually send to the pendingWithdarwal contract so must be accounted for separately
     function estimatedTotalAssets() public view override returns (uint256) {
         (,uint totalPending) = withdrawalRequestsInfo();
-        return balanceOfWant() + valueOfPoolToken() + totalPending;
+        return balanceOfWant().add(valueOfTotalPoolTokens()).add(totalPending);
     }
 
     /// This strategy's accounting is a little different because funds are not liquid.
@@ -116,6 +121,7 @@ contract Strategy is BaseStrategy {
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
+        _claimReward();
         uint256 _balanceOfWant = balanceOfWant();
 
         if (_balanceOfWant > _debtOutstanding) {
@@ -124,10 +130,14 @@ contract Strategy is BaseStrategy {
             Pool memory poolData = poolCollection.poolData(want);
             uint256 depositLimit = poolData.depositLimit;
             uint256 stakedBalance = poolData.liquidity.stakedBalance;
-            uint256 investable = depositLimit > stakedBalance ? depositLimit.sub(stakedBalance) : 0;
+            uint256 investable = depositLimit >= stakedBalance ? depositLimit.sub(stakedBalance) : 0;
             _amountToInvest = Math.min(investable, _amountToInvest);
-            if (_amountToInvest > 0) {
-                bancor.deposit(want, _amountToInvest);
+            emit Debug("depositLimit", depositLimit);
+            emit Debug("stakedBalance", stakedBalance);
+
+            emit Debug("_amount", _amountToInvest);
+            if (_amountToInvest > 0 && currentProgramId != 0 && standardRewards.isProgramActive(currentProgramId) && standardRewards.isProgramEnabled(currentProgramId)) {
+                standardRewards.depositAndJoin(currentProgramId, _amountToInvest);
             }
         }
     }
@@ -138,12 +148,8 @@ contract Strategy is BaseStrategy {
     /* NOTE: Bancor has a waiting period for withdrawals. We need to first request
              a withdrawal, at which point we recieve a withdrawal request ID. 7 days later,
              we can complete the withdrawal with this ID. */
-    function liquidatePosition(uint256 _amountNeeded)
-    internal
-    override
-    returns (uint256 _liquidatedAmount, uint256 _loss){
-        uint256 looseWants = balanceOfWant();
-
+    function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _liquidatedAmount, uint256 _loss){
+        revert("disabled!");
     }
 
     function liquidateAllPositions() internal override returns (uint256) {
@@ -151,17 +157,14 @@ contract Strategy is BaseStrategy {
     }
 
     function prepareMigration(address _newStrategy) internal override {
+        _unstake(balanceOfStakedPoolToken());
         // cancel all pendingwithdrawals
         uint256[] memory ids = pendingWithdrawals.withdrawalRequestIds(address(this));
         for (uint8 i = 0; i < ids.length; i++) {
-            _cancelWithdrawal(ids[i]);
-        }
-
-        for (uint8 i = 0; i < ids.length; i++) {
+            _cancelWithdrawal(ids[i], false);
             lmRewards[i].transfer(_newStrategy, balanceOfReward(i));
         }
         poolToken.transfer(_newStrategy, balanceOfPoolToken());
-
     }
 
     function protectedTokens() internal view override returns (address[] memory){}
@@ -170,18 +173,36 @@ contract Strategy is BaseStrategy {
 
     // ----------------- SUPPORT & UTILITY FUNCTIONS ----------
 
-
-    function requestWithdrawal(uint256 _poolTokenAmount) external isVaultManager {
-        _requestWithdrawal(_poolTokenAmount);
+    /// normally StandardRewards.depositAndJoin() is used. This is here for composability
+    function deposit(uint256 _amountWants) external isVaultManager {
+        bancor.deposit(want, _amountWants);
     }
 
-    function _requestWithdrawal(uint256 _poolTokenAmount) internal {
-        uint256 _withdrawalID = bancor.initWithdrawal(poolToken, _poolTokenAmount);
+    function stake(uint256 _amountPoolTokens) external isVaultManager {
+        _stake(_amountPoolTokens);
+    }
 
-        // min
-        _poolTokenAmount = _poolTokenAmount > balanceOfPoolToken() ? balanceOfPoolToken() : _poolTokenAmount;
+    function _stake(uint256 _amountPoolTokens) internal {
+        standardRewards.join(currentProgramId, _amountPoolTokens);
+    }
 
-        // Technically we're losing bits 32-255 in the cast, but this should only matter if more than 4.2B withdrawal requests happen
+    function unstake(uint256 _amountPoolTokens) external isVaultManager {
+        _unstake(_amountPoolTokens);
+    }
+
+    function _unstake(uint256 _amountPoolTokens) internal {
+        standardRewards.leave(currentProgramId, _amountPoolTokens);
+    }
+
+    function requestWithdrawal(uint256 _poolTokenAmount, bool _unstakeFromRewards) external isVaultManager {
+        _requestWithdrawal(_poolTokenAmount, _unstakeFromRewards);
+    }
+
+    function _requestWithdrawal(uint256 _poolTokenAmount, bool _unstakeFromRewards) internal {
+        if (_unstakeFromRewards) {
+            _unstake(_poolTokenAmount);
+        }
+        bancor.initWithdrawal(poolToken, _poolTokenAmount);
     }
 
     function completeWithdrawal(uint256 _withdrawalID) external isVaultManager {
@@ -189,15 +210,32 @@ contract Strategy is BaseStrategy {
     }
 
     function _completeWithdrawal(uint256 _withdrawalID) internal {
+        require(pendingWithdrawals.isReadyForWithdrawal(_withdrawalID), "!ready");
         bancor.withdraw(_withdrawalID);
     }
 
-    function cancelWithdrawal(uint256 _withdrawalID) external isVaultManager {
-        _cancelWithdrawal(_withdrawalID);
+    function cancelWithdrawal(uint256 _withdrawalID, bool _restake) external isVaultManager {
+        _cancelWithdrawal(_withdrawalID, _restake);
     }
 
-    function _cancelWithdrawal(uint256 _withdrawalID) internal {
+    /// if canceled, bnTokens need to be re-entered into rewards
+    function _cancelWithdrawal(uint256 _withdrawalID, bool _restake) internal {
         bancor.cancelWithdrawal(_withdrawalID);
+        if (_restake) {
+            _stake(balanceOfPoolToken());
+        }
+    }
+
+    function claimReward() external isVaultManager {
+        _claimReward();
+    }
+
+    function _claimReward() internal {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = currentProgramId;
+        if (standardRewards.pendingRewards(address(this), ids) > 0) {
+            standardRewards.claimRewards(ids);
+        }
     }
 
     // _checkAllowance adapted from https://github.com/therealmonoloco/liquity-stability-pool-strategy/blob/1fb0b00d24e0f5621f1e57def98c26900d551089/contracts/Strategy.sol#L316
@@ -228,8 +266,12 @@ contract Strategy is BaseStrategy {
         return poolToken.balanceOf(address(this));
     }
 
-    function valueOfPoolToken() public view returns (uint256) {
-        return poolCollection.poolTokenToUnderlying(want, balanceOfPoolToken());
+    function balanceOfStakedPoolToken() public view returns (uint256) {
+        return standardRewards.providerStake(address(this), currentProgramId);
+    }
+
+    function valueOfTotalPoolTokens() public view returns (uint256) {
+        return poolCollection.poolTokenToUnderlying(want, balanceOfPoolToken().add(balanceOfStakedPoolToken()));
     }
 
     /// sum amount of all pending withdrawals
@@ -243,14 +285,14 @@ contract Strategy is BaseStrategy {
     function withdrawalRequestsInfo() public view returns (WithdrawRequestInfo[] memory requestsInfo, uint256 _wants){
         uint256[] memory ids = pendingWithdrawals.withdrawalRequestIds(address(this));
         if (ids.length > 0) {
-            requestsInfo = new WithdrawRequestInfo[](ids.length - 1);
+            requestsInfo = new WithdrawRequestInfo[](ids.length);
             for (uint8 i = 0; i < ids.length; i++) {
                 uint256 matureTime = pendingWithdrawals.withdrawalRequest(ids[i]).createdAt + pendingWithdrawals.lockDuration();
                 requestsInfo[i] = WithdrawRequestInfo(
                     ids[i],
                     pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount,
                     pendingWithdrawals.withdrawalRequest(ids[i]).poolTokenAmount,
-                    now > matureTime ? now - matureTime : 0
+                    matureTime > now ? matureTime - now : 0
                 );
                 _wants += pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount;
             }
@@ -261,7 +303,6 @@ contract Strategy is BaseStrategy {
     function balanceOfReward(uint8 index) public view returns (uint256){
         return lmRewards[index].balanceOf(address(this));
     }
-
 
     /// for bnt and other possible rewards from liquidity mining
     function whitelistRewards(IERC20 _reward) external isVaultManager {
@@ -293,5 +334,11 @@ contract Strategy is BaseStrategy {
     function disableTradeFactory() external onlyVaultManagers {
         delete tradeFactory;
         _disallowAllRewards();
+    }
+
+    /* NOTE: Reward staking has an active program id which might change.
+    Override allows control over which program to withdraw from. */
+    function overrideProgramId(uint256 _newProgramId) external onlyVaultManagers {
+        currentProgramId = _newProgramId;
     }
 }
