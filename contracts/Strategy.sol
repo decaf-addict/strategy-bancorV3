@@ -16,16 +16,12 @@ import "../interfaces/Bancor/IPoolCollection.sol";
 import "../interfaces/Bancor/IPendingWithdrawals.sol";
 import "../interfaces/Bancor/IStandardRewards.sol";
 
-interface ITradeFactory {
-    function enable(address, address) external;
-
-    function disable(address, address) external;
-}
 
 contract Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
 
+    IERC20 public constant bnt = IERC20(0x1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C);
     IBancorNetwork public constant bancor = IBancorNetwork(0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB);
     IStandardRewards public constant standardRewards = IStandardRewards(0xb0B958398ABB0b5DB4ce4d7598Fb868f5A00f372);
     IPendingWithdrawals public constant pendingWithdrawals = IPendingWithdrawals(0x857Eb0Eb2572F7092C417CD386BA82e45EbA9B8a);
@@ -33,7 +29,6 @@ contract Strategy is BaseStrategy {
     IPoolToken public poolToken;
     IERC20[] public lmRewards;
     Toggles public toggles;
-    ITradeFactory public tradeFactory;
     uint256 public currentProgramId;
 
     modifier isVaultManager {
@@ -48,6 +43,8 @@ contract Strategy is BaseStrategy {
     struct Toggles {
         bool lossWarningOn; // first line of defense
         bool realizeLossOn;
+        bool userWithdrawOn;
+        bool sellRewardsOnHarvestOn;
     }
 
     constructor(address _vault) public BaseStrategy(_vault) {
@@ -71,7 +68,14 @@ contract Strategy is BaseStrategy {
         want.approve(address(bancor), type(uint256).max);
         poolToken.approve(address(bancor), type(uint256).max);
         poolToken.approve(address(pendingWithdrawals), type(uint256).max);
+        bnt.approve(address(bancor), type(uint256).max);
         currentProgramId = standardRewards.latestProgramId(address(want));
+        toggles = Toggles({
+        lossWarningOn : true,
+        realizeLossOn : false,
+        userWithdrawOn : false,
+        sellRewardsOnHarvestOn : true
+        });
     }
 
 
@@ -79,7 +83,7 @@ contract Strategy is BaseStrategy {
         return
         string(
             abi.encodePacked(
-                "StrategyBancor",
+                "StrategyBancorV3",
                 IERC20Metadata(address(want)).symbol()
             )
         );
@@ -87,7 +91,7 @@ contract Strategy is BaseStrategy {
 
     /// tokens pending withdrawals are actually send to the pendingWithdarwal contract so must be accounted for separately
     function estimatedTotalAssets() public view override returns (uint256) {
-        (,uint totalPending) = withdrawalRequestsInfo();
+        (, uint totalPending) = withdrawalRequestsInfo();
         return balanceOfWant().add(valueOfTotalPoolTokens()).add(totalPending);
     }
 
@@ -95,12 +99,20 @@ contract Strategy is BaseStrategy {
     /// On harvest it'll try to pay debt with loose wants only
     /// losses are not realized unless toggled on
     function prepareReturn(uint256 _debtOutstanding) internal override returns (uint256 _profit, uint256 _loss, uint256 _debtPayment){
+        _claimReward();
+        if (toggles.sellRewardsOnHarvestOn) {
+            _sellReward(bnt);
+            for (uint8 i; i < lmRewards.length; i++) {
+                _sellReward(lmRewards[i]);
+            }
+        }
+
         uint256 totalDebt = vault.strategies(address(this)).totalDebt;
         uint256 totalAssets = estimatedTotalAssets();
         uint256 liquidWants = balanceOfWant();
         _debtPayment = Math.min(liquidWants, _debtOutstanding);
 
-        if (totalAssets > totalDebt) {
+        if (totalAssets >= totalDebt) {
             // if there are any remaining wants, consider them as profit
             uint256 estimatedProfits = totalAssets.sub(totalDebt);
             // pay debts first, any remaining go to profit
@@ -132,28 +144,34 @@ contract Strategy is BaseStrategy {
             uint256 stakedBalance = poolData.liquidity.stakedBalance;
             uint256 investable = depositLimit >= stakedBalance ? depositLimit.sub(stakedBalance) : 0;
             _amountToInvest = Math.min(investable, _amountToInvest);
-            emit Debug("depositLimit", depositLimit);
-            emit Debug("stakedBalance", stakedBalance);
 
-            emit Debug("_amount", _amountToInvest);
             if (_amountToInvest > 0 && currentProgramId != 0 && standardRewards.isProgramActive(currentProgramId) && standardRewards.isProgramEnabled(currentProgramId)) {
                 standardRewards.depositAndJoin(currentProgramId, _amountToInvest);
             }
         }
     }
 
-    event Debug(string msg);
-    event Debug(string msg, uint val);
 
     /* NOTE: Bancor has a waiting period for withdrawals. We need to first request
              a withdrawal, at which point we recieve a withdrawal request ID. 7 days later,
              we can complete the withdrawal with this ID. */
     function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _liquidatedAmount, uint256 _loss){
-        revert("disabled!");
+        if (toggles.userWithdrawOn) {
+            _liquidatedAmount = Math.min(_amountNeeded, balanceOfWant());
+            _loss = _amountNeeded.sub(_liquidatedAmount);
+        } else {
+            // this is to make sure we don't accidentally register loss
+            revert("disabled!");
+        }
     }
 
     function liquidateAllPositions() internal override returns (uint256) {
-        return want.balanceOf(address(this));
+        if (toggles.userWithdrawOn) {
+            return balanceOfWant();
+        } else {
+            // this is to make sure we don't accidentally register loss
+            revert("disabled!");
+        }
     }
 
     function prepareMigration(address _newStrategy) internal override {
@@ -205,14 +223,19 @@ contract Strategy is BaseStrategy {
         bancor.initWithdrawal(poolToken, _poolTokenAmount);
     }
 
-    function completeWithdrawal(uint256 _withdrawalID) external isVaultManager {
-        _completeWithdrawal(_withdrawalID);
+    function completeWithdrawal(uint256 _withdrawalID, bool _sellBnt) external isVaultManager {
+        _completeWithdrawal(_withdrawalID, _sellBnt);
     }
 
-    function _completeWithdrawal(uint256 _withdrawalID) internal {
+    function _completeWithdrawal(uint256 _withdrawalID, bool _sellBnt) internal {
         require(pendingWithdrawals.isReadyForWithdrawal(_withdrawalID), "!ready");
+        uint256 bntBefore = balanceOfBnt();
         bancor.withdraw(_withdrawalID);
+        if (_sellBnt) {
+            _sellReward(bnt);
+        }
     }
+
 
     function cancelWithdrawal(uint256 _withdrawalID, bool _restake) external isVaultManager {
         _cancelWithdrawal(_withdrawalID, _restake);
@@ -233,28 +256,27 @@ contract Strategy is BaseStrategy {
     function _claimReward() internal {
         uint256[] memory ids = new uint256[](1);
         ids[0] = currentProgramId;
-        if (standardRewards.pendingRewards(address(this), ids) > 0) {
+        if (balanceOfPendingReward() > 0) {
             standardRewards.claimRewards(ids);
         }
     }
 
-    // _checkAllowance adapted from https://github.com/therealmonoloco/liquity-stability-pool-strategy/blob/1fb0b00d24e0f5621f1e57def98c26900d551089/contracts/Strategy.sol#L316
-    function _checkAllowance(
-        address _spender,
-        address _token,
-        uint256 _amount
-    ) internal {
-        uint256 _currentAllowance = IERC20(_token).allowance(address(this), _spender);
-        if (_currentAllowance < _amount) {
-            IERC20(_token).safeIncreaseAllowance(
-                _spender,
-                _amount - _currentAllowance
-            );
-        } else {
-            IERC20(_token).safeDecreaseAllowance(
-                _spender,
-                _currentAllowance - _amount
-            );
+
+    function sellReward(IERC20 _rewardToken) external onlyVaultManagers {
+        _sellReward(_rewardToken);
+    }
+
+
+    function _sellReward(IERC20 _rewardToken) internal {
+        uint256 balance = _rewardToken.balanceOf(address(this));
+        if (balance > 0) {
+            bancor.tradeBySourceAmount(
+                _rewardToken,
+                want,
+                balance,
+                1,
+                now,
+                address(this));
         }
     }
 
@@ -268,6 +290,12 @@ contract Strategy is BaseStrategy {
 
     function balanceOfStakedPoolToken() public view returns (uint256) {
         return standardRewards.providerStake(address(this), currentProgramId);
+    }
+
+    function balanceOfPendingReward() public view returns (uint256){
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = currentProgramId;
+        return standardRewards.pendingRewards(address(this), ids);
     }
 
     function valueOfTotalPoolTokens() public view returns (uint256) {
@@ -299,42 +327,37 @@ contract Strategy is BaseStrategy {
         }
     }
 
+    function balanceOfBnt() public view returns (uint256){
+        return bnt.balanceOf(address(this));
+    }
 
     function balanceOfReward(uint8 index) public view returns (uint256){
         return lmRewards[index].balanceOf(address(this));
     }
 
-    /// for bnt and other possible rewards from liquidity mining
+    /// other possible rewards from liquidity mining. Don't need to whitelist bnt
     function whitelistRewards(IERC20 _reward) external isVaultManager {
-        lmRewards.push(_reward);
-        _reward.approve(address(tradeFactory), type(uint256).max);
-        tradeFactory.enable(address(_reward), address(want));
+        _whitelistRewards(_reward);
     }
+
+    function _whitelistRewards(IERC20 _reward) internal {
+        lmRewards.push(_reward);
+        _reward.approve(address(bancor), type(uint256).max);
+    }
+
 
     function delistAllRewards() external isVaultManager {
+        for (uint8 i; i < lmRewards.length; i++) {
+            lmRewards[i].safeApprove(address(bancor), 0);
+        }
         delete lmRewards;
-        _disallowAllRewards();
     }
 
-    function _disallowAllRewards() internal {
-        for (uint8 i; i < lmRewards.length; i++) {
-            lmRewards[i].safeApprove(address(tradeFactory), 0);
-            tradeFactory.disable(address(lmRewards[i]), address(want));
-        }
-    }
 
     function setToggles(Toggles memory _toggles) external isVaultManager {
         toggles = _toggles;
     }
 
-    function setTradeFactory(ITradeFactory _tradeFactory) external onlyGovernance {
-        tradeFactory = _tradeFactory;
-    }
-
-    function disableTradeFactory() external onlyVaultManagers {
-        delete tradeFactory;
-        _disallowAllRewards();
-    }
 
     /* NOTE: Reward staking has an active program id which might change.
     Override allows control over which program to withdraw from. */

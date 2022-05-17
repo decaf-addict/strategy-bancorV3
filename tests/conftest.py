@@ -3,6 +3,11 @@ from brownie import config
 from brownie import Contract
 
 
+@pytest.fixture(autouse=True)
+def isolation(fn_isolation):
+    pass
+
+
 @pytest.fixture
 def gov(accounts):
     yield accounts.at("0xFEB4acf3df3cDEA7399794D0869ef76A6EfAff52", force=True)
@@ -89,24 +94,28 @@ def strategy_factory(strategist, keeper, vault, StrategyFactory, gov):
 
 
 @pytest.fixture
-def tradeFactory():
-    yield Contract("0x7BAF843e06095f68F4990Ca50161C2C4E4e01ec6")
-
-
-@pytest.fixture
 def yMechs():
     yield Contract("0x2C01B4AD51a67E2d8F02208F54dF9aC4c0B778B6")
 
 
 @pytest.fixture
-def strategy(strategist, keeper, vault, Strategy, strategy_factory, gov, tradeFactory, yMechs, chain, from_gov):
+def bnt():
+    yield Contract("0x1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C")
+
+
+@pytest.fixture
+def bnt_whale(accounts, strategy, bnt):
+    whale = accounts.at("0x649765821D9f64198c905eC0B2B037a4a52Bc373", force=True)
+    bnt.approve(strategy, 2 ** 256 - 1, {'from': whale})
+    yield whale
+
+
+@pytest.fixture
+def strategy(strategist, keeper, vault, Strategy, strategy_factory, gov, yMechs, chain, from_gov):
     strategy = Strategy.at(strategy_factory.original(), owner=gov)
     strategy.setKeeper(keeper, {"from": gov})
     vault.addStrategy(strategy, 10_000, 0, 2 ** 256 - 1, 1_000, from_gov)
-    tradeFactory.grantRole(
-        tradeFactory.STRATEGY(), strategy, {"from": yMechs, "gas_price": "0 gwei"}
-    )
-    strategy.setTradeFactory(tradeFactory, from_gov)
+    vault.setManagementFee(0, {'from': gov})
     chain.sleep(1)
     yield strategy
 

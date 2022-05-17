@@ -3,6 +3,7 @@ from brownie import Contract
 import pytest
 
 
+# lossy operations
 def test_operation(
         chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX, gov
 ):
@@ -26,61 +27,91 @@ def test_operation(
     # 7 days of cooldown to withdraw
     chain.sleep(3600 * 24 * 7 + 1)
     id = strategy.withdrawalRequestsInfo()[0][0][0]
-    strategy.completeWithdrawal(id)
+    strategy.completeWithdrawal(id, True)
 
     # no withdrawals allowed for strat, only debtPayment
-    vault.updateStrategyDebtRatio(strategy, 0)
-    vault.harvest({"from": gov})
-    assert (
-            pytest.approx(token.balanceOf(user), rel=RELATIVE_APPROX) == user_balance_before
-    )
+    vault.updateStrategyDebtRatio(strategy, 0, {"from": gov})
+    # loss from withdraw fee not covered by lm rewards
+    with brownie.reverts("loss!"):
+        strategy.harvest({"from": gov})
+
+    strategy.setToggles((False, True, False, True))
+
+    with brownie.reverts():
+        vault.withdraw(amount, strategy.address, 1000, {'from': user})
+
+    strategy.setToggles((False, True, True, True))
+
+    vault.withdraw(amount, user, 1000, {'from': user})
+
+    # losses from withdrawal fee + price impact of selling bnt
+
+    assert token.balanceOf(user) >= user_balance_before * 0.9950
 
 
-def test_emergency_exit(
-        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+def test_profitable_operation(
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX, gov
 ):
     # Deposit to the vault
-    token.approve(vault.address, amount, {"from": user})
-    vault.deposit(amount, {"from": user})
-    chain.sleep(1)
-    strategy.harvest()
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
-
-    # set emergency and exit
-    strategy.setEmergencyExit()
-    chain.sleep(1)
-    strategy.harvest()
-    assert strategy.estimatedTotalAssets() < amount
-
-
-def test_profitable_harvest(
-        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
-):
-    # Deposit to the vault
+    user_balance_before = token.balanceOf(user)
     token.approve(vault.address, amount, {"from": user})
     vault.deposit(amount, {"from": user})
     assert token.balanceOf(vault.address) == amount
 
-    # Harvest 1: Send funds through the strategy
+    # harvest
     chain.sleep(1)
     strategy.harvest()
     assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    assert strategy.balanceOfStakedPoolToken() > 0
 
-    # TODO: Add some code before harvest #2 to simulate earning yield
+    # accrue two weeks of lm rewards
+    chain.sleep(3600 * 24 * 14)
 
-    # Harvest 2: Realize profit
+    pps_before = vault.pricePerShare()
+    strategy.harvest({"from": gov})
+    chain.sleep(3600 * 24)
+    chain.mine(1)
+    assert vault.pricePerShare() > pps_before
+
+
+def test_profitable_exit(
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX, gov, bnt_whale, bnt
+):
+    # Deposit to the vault
+    user_balance_before = token.balanceOf(user)
+    token.approve(vault.address, amount, {"from": user})
+    vault.deposit(amount, {"from": user})
+    assert token.balanceOf(vault.address) == amount
+
+    # harvest
     chain.sleep(1)
     strategy.harvest()
-    chain.sleep(3600 * 6)  # 6 hrs needed for profits to unlock
-    chain.mine(1)
-    profit = token.balanceOf(vault.address)  # Profits go to vault
-    # TODO: Uncomment the lines below
-    # assert token.balanceOf(strategy) + profit > amount
-    # assert vault.pricePerShare() > before_pps
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    assert strategy.balanceOfStakedPoolToken() > 0
+    # accrue 1m of lm rewards
+    chain.sleep(3600 * 24 * 30)
+    # seems like rewards cap at a certain amount per epoch, get some help with reward airdrop
+    bnt.transfer(strategy, 1000 * 1e18, {'from': bnt_whale})
+
+    strategy.requestWithdrawal(strategy.balanceOfStakedPoolToken(), True)
+
+    # 7 days of cooldown to withdraw
+    chain.sleep(3600 * 24 * 7 + 1)
+    id = strategy.withdrawalRequestsInfo()[0][0][0]
+    strategy.completeWithdrawal(id, True)
+
+    # no withdrawals allowed for strat, only debtPayment
+    vault.updateStrategyDebtRatio(strategy, 0, {"from": gov})
+
+    # profits from lm rewards should cover any fees
+    strategy.harvest({'from': gov})
+    vault.withdraw({'from': user})
+
+    assert token.balanceOf(user) >= user_balance_before
 
 
 def test_change_debt(
-        chain, gov, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, gov, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX, bnt, bnt_whale
 ):
     # Deposit to the vault and harvest
     token.approve(vault.address, amount, {"from": user})
@@ -97,12 +128,38 @@ def test_change_debt(
     strategy.harvest()
     assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
 
-    # In order to pass this tests, you will need to implement prepareReturn.
-    # TODO: uncomment the following lines.
-    # vault.updateStrategyDebtRatio(strategy.address, 5_000, {"from": gov})
-    # chain.sleep(1)
-    # strategy.harvest()
-    # assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == half
+    vault.updateStrategyDebtRatio(strategy.address, 5_000, {"from": gov})
+
+    strategy.requestWithdrawal(vault.debtOutstanding(strategy), True)
+
+    # 7 days of cooldown to withdraw
+    chain.sleep(3600 * 24 * 7 + 1)
+    id = strategy.withdrawalRequestsInfo()[0][0][0]
+    strategy.completeWithdrawal(id, True)
+
+    # allow lossy harvest
+    strategy.setToggles((False, True, True, True))
+
+    strategy.harvest({'from': gov})
+    vault.withdraw(amount / 2, user, 1000, {'from': user})
+    assert token.balanceOf(user) >= amount / 2 * .995
+
+    vault.updateStrategyDebtRatio(strategy.address, 0, {"from": gov})
+
+    strategy.requestWithdrawal(vault.debtOutstanding(strategy), True)
+
+    # 7 days of cooldown to withdraw
+    chain.sleep(3600 * 24 * 7 + 1)
+    id = strategy.withdrawalRequestsInfo()[0][0][0]
+    strategy.completeWithdrawal(id, True)
+
+    # instead of the same lossy withdrawal, we test profitable + debtPayment
+    # airdrop rewards to test debtPayment + profits
+    bnt.transfer(strategy, 1000 * 1e18, {'from': bnt_whale})
+
+    strategy.harvest({'from': gov})
+    vault.withdraw({'from': user})
+    assert token.balanceOf(user) >= 0
 
 
 def test_sweep(gov, vault, strategy, token, user, amount, weth, weth_amout):
