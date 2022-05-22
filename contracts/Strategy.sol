@@ -65,7 +65,7 @@ contract Strategy is BaseStrategy {
         poolCollection = bancor.collectionByPool(want);
         poolToken = poolCollection.poolToken(want);
         want.safeApprove(address(standardRewards), type(uint256).max);
-        want.approve(address(bancor), type(uint256).max);
+        want.safeApprove(address(bancor), type(uint256).max);
         poolToken.approve(address(bancor), type(uint256).max);
         poolToken.approve(address(pendingWithdrawals), type(uint256).max);
         bnt.approve(address(bancor), type(uint256).max);
@@ -133,7 +133,6 @@ contract Strategy is BaseStrategy {
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
-        _claimReward();
         uint256 _balanceOfWant = balanceOfWant();
 
         if (_balanceOfWant > _debtOutstanding) {
@@ -145,8 +144,9 @@ contract Strategy is BaseStrategy {
             uint256 investable = depositLimit >= stakedBalance ? depositLimit.sub(stakedBalance) : 0;
             _amountToInvest = Math.min(investable, _amountToInvest);
 
-            if (_amountToInvest > 0 && currentProgramId != 0 && standardRewards.isProgramActive(currentProgramId) && standardRewards.isProgramEnabled(currentProgramId)) {
-                standardRewards.depositAndJoin(currentProgramId, _amountToInvest);
+            uint256 programId = currentProgramId;
+            if (_amountToInvest > 0 && programId != 0 && standardRewards.isProgramActive(programId) && standardRewards.isProgramEnabled(programId)) {
+                standardRewards.depositAndJoin(programId, _amountToInvest);
             }
         }
     }
@@ -180,7 +180,13 @@ contract Strategy is BaseStrategy {
         uint256[] memory ids = pendingWithdrawals.withdrawalRequestIds(address(this));
         for (uint8 i = 0; i < ids.length; i++) {
             _cancelWithdrawal(ids[i], false);
-            lmRewards[i].transfer(_newStrategy, balanceOfReward(i));
+        }
+
+        for (uint8 i = 0; i < lmRewards.length; i++) {
+            uint256 balance = balanceOfReward(i);
+            if (balance > 0) {
+                lmRewards[i].safeTransfer(_newStrategy, balance);
+            }
         }
         poolToken.transfer(_newStrategy, balanceOfPoolToken());
     }
@@ -229,7 +235,6 @@ contract Strategy is BaseStrategy {
 
     function _completeWithdrawal(uint256 _withdrawalID, bool _sellBnt) internal {
         require(pendingWithdrawals.isReadyForWithdrawal(_withdrawalID), "!ready");
-        uint256 bntBefore = balanceOfBnt();
         bancor.withdraw(_withdrawalID);
         if (_sellBnt) {
             _sellReward(bnt);
@@ -262,7 +267,7 @@ contract Strategy is BaseStrategy {
     }
 
 
-    function sellReward(IERC20 _rewardToken) external onlyVaultManagers {
+    function sellReward(IERC20 _rewardToken) external isVaultManager {
         _sellReward(_rewardToken);
     }
 
@@ -342,15 +347,17 @@ contract Strategy is BaseStrategy {
 
     function _whitelistRewards(IERC20 _reward) internal {
         lmRewards.push(_reward);
-        _reward.approve(address(bancor), type(uint256).max);
+        _reward.safeApprove(address(bancor), type(uint256).max);
     }
 
 
     function delistAllRewards() external isVaultManager {
         for (uint8 i; i < lmRewards.length; i++) {
-            lmRewards[i].safeApprove(address(bancor), 0);
+            for (uint8 i; i < lmRewards.length; i++) {
+                lmRewards[i].safeApprove(address(bancor), 0);
+            }
+            delete lmRewards;
         }
-        delete lmRewards;
     }
 
 
@@ -361,7 +368,7 @@ contract Strategy is BaseStrategy {
 
     /* NOTE: Reward staking has an active program id which might change.
     Override allows control over which program to withdraw from. */
-    function overrideProgramId(uint256 _newProgramId) external onlyVaultManagers {
+    function overrideProgramId(uint256 _newProgramId) external isVaultManager {
         currentProgramId = _newProgramId;
     }
 }
