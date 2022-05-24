@@ -12,7 +12,6 @@ import {Math} from "@openzeppelin/contracts/math/Math.sol";
 
 import {IERC20Metadata} from "@yearnvaults/contracts/yToken.sol";
 import "../interfaces/Bancor/IBancorNetwork.sol";
-import "../interfaces/Bancor/IPoolCollection.sol";
 import "../interfaces/Bancor/IPendingWithdrawals.sol";
 import "../interfaces/Bancor/IStandardRewards.sol";
 
@@ -21,11 +20,11 @@ contract Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
 
-    IERC20 public constant bnt = IERC20(0x1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C);
-    IBancorNetwork public constant bancor = IBancorNetwork(0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB);
+    IBancorNetworkInfo public constant info = IBancorNetworkInfo(0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB);
     IStandardRewards public constant standardRewards = IStandardRewards(0xb0B958398ABB0b5DB4ce4d7598Fb868f5A00f372);
-    IPendingWithdrawals public constant pendingWithdrawals = IPendingWithdrawals(0x857Eb0Eb2572F7092C417CD386BA82e45EbA9B8a);
-    IPoolCollection public poolCollection;
+    IPendingWithdrawals public immutable pendingWithdrawals;
+    IERC20 public immutable bnt;
+    IBancorNetwork public immutable bancor;
     IPoolToken public poolToken;
     IERC20[] public lmRewards;
     Toggles public toggles;
@@ -62,8 +61,11 @@ contract Strategy is BaseStrategy {
     }
 
     function _initializeStrat(address _vault) internal {
-        poolCollection = bancor.collectionByPool(want);
-        poolToken = poolCollection.poolToken(want);
+        pendingWithdrawals = IPendingWithdrawals(info.pendingWithdrawals());
+        bancor = IBancorNetwork(info.network());
+        bnt = IERC20(info.bnt());
+
+        poolToken = info.poolToken(want);
         want.safeApprove(address(standardRewards), type(uint256).max);
         want.safeApprove(address(bancor), type(uint256).max);
         poolToken.approve(address(bancor), type(uint256).max);
@@ -137,13 +139,6 @@ contract Strategy is BaseStrategy {
 
         if (_balanceOfWant > _debtOutstanding) {
             uint256 _amountToInvest = _balanceOfWant - _debtOutstanding;
-
-            Pool memory poolData = poolCollection.poolData(want);
-            uint256 depositLimit = poolData.depositLimit;
-            uint256 stakedBalance = poolData.liquidity.stakedBalance;
-            uint256 investable = depositLimit >= stakedBalance ? depositLimit.sub(stakedBalance) : 0;
-            _amountToInvest = Math.min(investable, _amountToInvest);
-
             uint256 programId = currentProgramId;
             if (_amountToInvest > 0 && programId != 0 && standardRewards.isProgramActive(programId) && standardRewards.isProgramEnabled(programId)) {
                 standardRewards.depositAndJoin(programId, _amountToInvest);
@@ -304,7 +299,7 @@ contract Strategy is BaseStrategy {
     }
 
     function valueOfTotalPoolTokens() public view returns (uint256) {
-        return poolCollection.poolTokenToUnderlying(want, balanceOfPoolToken().add(balanceOfStakedPoolToken()));
+        return info.poolTokenToUnderlying(want, balanceOfPoolToken().add(balanceOfStakedPoolToken()));
     }
 
     /// sum amount of all pending withdrawals
@@ -353,11 +348,9 @@ contract Strategy is BaseStrategy {
 
     function delistAllRewards() external isVaultManager {
         for (uint8 i; i < lmRewards.length; i++) {
-            for (uint8 i; i < lmRewards.length; i++) {
-                lmRewards[i].safeApprove(address(bancor), 0);
-            }
-            delete lmRewards;
+            lmRewards[i].safeApprove(address(bancor), 0);
         }
+        delete lmRewards;
     }
 
 
