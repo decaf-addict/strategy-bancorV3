@@ -17,14 +17,14 @@ import "../interfaces/Bancor/IStandardRewards.sol";
 
 
 contract Strategy is BaseStrategy {
-    using SafeERC20 for IERC20;
-    using Address for address;
+    using SafeERC20 for IPoolToken;
+    using SafeMath for uint32;
 
-    IBancorNetworkInfo public constant info = IBancorNetworkInfo(0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB);
+    IBancorNetworkInfo public constant info = IBancorNetworkInfo(0x8E303D296851B320e6a697bAcB979d13c9D6E760);
     IStandardRewards public constant standardRewards = IStandardRewards(0xb0B958398ABB0b5DB4ce4d7598Fb868f5A00f372);
-    IPendingWithdrawals public immutable pendingWithdrawals;
-    IERC20 public immutable bnt;
-    IBancorNetwork public immutable bancor;
+    IPendingWithdrawals public constant pendingWithdrawals = IPendingWithdrawals(0x857Eb0Eb2572F7092C417CD386BA82e45EbA9B8a);
+    IERC20 public constant bnt = IERC20(0x1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C);
+    IBancorNetwork public constant bancor = IBancorNetwork(0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB);
     IPoolToken public poolToken;
     IERC20[] public lmRewards;
     Toggles public toggles;
@@ -40,14 +40,14 @@ contract Strategy is BaseStrategy {
     }
 
     struct Toggles {
-        bool lossWarningOn; // first line of defense
-        bool realizeLossOn;
-        bool userWithdrawOn;
-        bool sellRewardsOnHarvestOn;
+        bool lossWarningOn; // on = revert if harvest results in loss. off = nothing
+        bool realizeLossOn; // on = allow harvest to realize loss. off = loss is
+        bool userWithdrawOn; // on = allow users to withdraw  off = revert if user tries to withdraw
+        bool sellRewardsOnHarvestOn; // on = sell bnt+lm on harvest
     }
 
     constructor(address _vault) public BaseStrategy(_vault) {
-        _initializeStrat(_vault);
+        _initializeStrat();
     }
 
     function initialize(
@@ -57,20 +57,16 @@ contract Strategy is BaseStrategy {
         address _keeper
     ) external {
         _initialize(_vault, _strategist, _rewards, _keeper);
-        _initializeStrat(_vault);
+        _initializeStrat();
     }
 
-    function _initializeStrat(address _vault) internal {
-        pendingWithdrawals = IPendingWithdrawals(info.pendingWithdrawals());
-        bancor = IBancorNetwork(info.network());
-        bnt = IERC20(info.bnt());
-
-        poolToken = info.poolToken(want);
+    function _initializeStrat() internal {
+        poolToken = info.poolToken(address(want));
         want.safeApprove(address(standardRewards), type(uint256).max);
         want.safeApprove(address(bancor), type(uint256).max);
-        poolToken.approve(address(bancor), type(uint256).max);
-        poolToken.approve(address(pendingWithdrawals), type(uint256).max);
-        bnt.approve(address(bancor), type(uint256).max);
+        poolToken.safeApprove(address(bancor), type(uint256).max);
+        poolToken.safeApprove(address(pendingWithdrawals), type(uint256).max);
+        bnt.safeApprove(address(bancor), type(uint256).max);
         currentProgramId = standardRewards.latestProgramId(address(want));
         toggles = Toggles({
         lossWarningOn : true,
@@ -138,10 +134,13 @@ contract Strategy is BaseStrategy {
         uint256 _balanceOfWant = balanceOfWant();
 
         if (_balanceOfWant > _debtOutstanding) {
-            uint256 _amountToInvest = _balanceOfWant - _debtOutstanding;
+            uint256 _amountToInvest = _balanceOfWant.sub(_debtOutstanding);
             uint256 programId = currentProgramId;
-            if (_amountToInvest > 0 && programId != 0 && standardRewards.isProgramActive(programId) && standardRewards.isProgramEnabled(programId)) {
-                standardRewards.depositAndJoin(programId, _amountToInvest);
+            if (_amountToInvest > 0) {
+                _deposit(_amountToInvest);
+                if (programId != 0 && standardRewards.isProgramActive(programId) && standardRewards.isProgramEnabled(programId)) {
+                    _stake(balanceOfPoolToken());
+                }
             }
         }
     }
@@ -153,7 +152,7 @@ contract Strategy is BaseStrategy {
     function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _liquidatedAmount, uint256 _loss){
         if (toggles.userWithdrawOn) {
             _liquidatedAmount = Math.min(_amountNeeded, balanceOfWant());
-            _loss = _amountNeeded.sub(_liquidatedAmount);
+            // _loss = 0 here since illiquid funds shouldn't be considered loss
         } else {
             // this is to make sure we don't accidentally register loss
             revert("disabled!");
@@ -183,7 +182,7 @@ contract Strategy is BaseStrategy {
                 lmRewards[i].safeTransfer(_newStrategy, balance);
             }
         }
-        poolToken.transfer(_newStrategy, balanceOfPoolToken());
+        poolToken.safeTransfer(_newStrategy, balanceOfPoolToken());
     }
 
     function protectedTokens() internal view override returns (address[] memory){}
@@ -192,8 +191,12 @@ contract Strategy is BaseStrategy {
 
     // ----------------- SUPPORT & UTILITY FUNCTIONS ----------
 
-    /// normally StandardRewards.depositAndJoin() is used. This is here for composability
+    /// Functinos for composability
     function deposit(uint256 _amountWants) external isVaultManager {
+        _deposit(_amountWants);
+    }
+
+    function _deposit(uint256 _amountWants) internal {
         bancor.deposit(want, _amountWants);
     }
 
@@ -275,7 +278,7 @@ contract Strategy is BaseStrategy {
                 want,
                 balance,
                 1,
-                now,
+                block.timestamp,
                 address(this));
         }
     }
@@ -299,7 +302,7 @@ contract Strategy is BaseStrategy {
     }
 
     function valueOfTotalPoolTokens() public view returns (uint256) {
-        return info.poolTokenToUnderlying(want, balanceOfPoolToken().add(balanceOfStakedPoolToken()));
+        return info.poolTokenToUnderlying(address(want), balanceOfPoolToken().add(balanceOfStakedPoolToken()));
     }
 
     /// sum amount of all pending withdrawals
@@ -310,19 +313,20 @@ contract Strategy is BaseStrategy {
         uint256 timeToMaturation;
     }
 
-    function withdrawalRequestsInfo() public view returns (WithdrawRequestInfo[] memory requestsInfo, uint256 _wants){
+    function withdrawalRequestsInfo() public view returns (WithdrawRequestInfo[] memory requestsInfo, uint256 _wantsPending){
         uint256[] memory ids = pendingWithdrawals.withdrawalRequestIds(address(this));
         if (ids.length > 0) {
             requestsInfo = new WithdrawRequestInfo[](ids.length);
             for (uint8 i = 0; i < ids.length; i++) {
-                uint256 matureTime = pendingWithdrawals.withdrawalRequest(ids[i]).createdAt + pendingWithdrawals.lockDuration();
+                WithdrawalRequest memory request = pendingWithdrawals.withdrawalRequest(ids[i]);
+                uint256 matureTime = request.createdAt.add(pendingWithdrawals.lockDuration());
                 requestsInfo[i] = WithdrawRequestInfo(
                     ids[i],
-                    pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount,
-                    pendingWithdrawals.withdrawalRequest(ids[i]).poolTokenAmount,
-                    matureTime > now ? matureTime - now : 0
+                    request.reserveTokenAmount,
+                    request.poolTokenAmount,
+                    matureTime > block.timestamp ? matureTime - block.timestamp : 0
                 );
-                _wants += pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount;
+                _wantsPending = _wantsPending.add(pendingWithdrawals.withdrawalRequest(ids[i]).reserveTokenAmount);
             }
         }
     }
@@ -362,6 +366,9 @@ contract Strategy is BaseStrategy {
     /* NOTE: Reward staking has an active program id which might change.
     Override allows control over which program to withdraw from. */
     function overrideProgramId(uint256 _newProgramId) external isVaultManager {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = _newProgramId;
+        require(standardRewards.programs(ids)[0].pool == Token(address(want)), "wrong program!");
         currentProgramId = _newProgramId;
     }
 }
